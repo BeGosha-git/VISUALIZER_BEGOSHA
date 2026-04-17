@@ -27,7 +27,7 @@ from PyQt6.QtWidgets import (
     QGridLayout,
     QSlider,
 )
-from typing import List, Optional
+from typing import Callable, List, Optional
 from PyQt6.QtGui import QBrush, QColor, QFont, QPainter, QPen
 
 from app.i18n import animation_label, movement_label, tr
@@ -39,11 +39,13 @@ from elements import (
     BaseVisualizationElement,
     GroupContainerElement,
     ImageElement,
+    MilkdropElement,
     WaveElement,
     OscilloscopeElement,
     TextElement,
     TrackNameElement,
     LineElement,
+    VideoElement,
 )
 
 logger = logging.getLogger(__name__)
@@ -436,6 +438,41 @@ class PropertiesPanel(QWidget):
             pass
         return w
 
+    def _hint_one_line(self, text: str) -> QLabel:
+        lb = QLabel(text)
+        lb.setWordWrap(False)
+        lb.setStyleSheet("color: #707070; font-size: 9px;")
+        try:
+            lb.setMaximumHeight(16)
+        except Exception:
+            pass
+        return lb
+
+    def _form_add_amplitude_slider(self, form: QFormLayout, initial: float, on_value: Callable[[int], None]) -> None:
+        sl = QSlider(Qt.Orientation.Horizontal)
+        sl.setRange(0, 50)
+        sl.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        sl.setMinimumHeight(28 if app_settings.ui_theme() == "glass" else 22)
+        iv = int(round(max(0.0, min(50.0, float(initial)))))
+        sl.setValue(iv)
+        vlab = QLabel(str(iv))
+        vlab.setMinimumWidth(28)
+        vlab.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        def _chg(x: int) -> None:
+            vx = max(0, min(50, int(x)))
+            vlab.setText(str(vx))
+            on_value(vx)
+
+        sl.valueChanged.connect(_chg)
+        row = QWidget()
+        hl = QHBoxLayout(row)
+        hl.setContentsMargins(0, 0, 0, 0)
+        hl.setSpacing(8)
+        hl.addWidget(sl, 1)
+        hl.addWidget(vlab, 0)
+        form.addRow(self._wrap_label(tr("props.amplitude")), self._prep_field(row))
+
     def _form(self) -> QFormLayout:
         form = QFormLayout()
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
@@ -493,7 +530,13 @@ class PropertiesPanel(QWidget):
             self._setup_group_container_properties(element)
             self._setup_common_properties(element)
             return
-        if isinstance(element, ImageElement):
+        if isinstance(element, MilkdropElement):
+            self._setup_milkdrop_properties(element)
+            self._setup_common_properties(element)
+            return
+        if isinstance(element, VideoElement):
+            self._setup_video_properties(element)
+        elif isinstance(element, ImageElement):
             self._setup_image_properties(element)
         elif isinstance(element, WaveElement) and not isinstance(element, OscilloscopeElement):
             self._setup_wave_properties(element)
@@ -545,13 +588,29 @@ class PropertiesPanel(QWidget):
 
         movement_combo.currentIndexChanged.connect(_on_move)
         form.addRow(self._wrap_label(tr("props.image.movement")), self._prep_field(movement_combo))
-        ga_spin = QDoubleSpinBox()
-        ga_spin.setRange(0.0, 10.0)
-        ga_spin.setSingleStep(0.1)
-        ga_spin.setDecimals(2)
-        ga_spin.setValue(min(10.0, float(g.group_amplitude)))
-        ga_spin.valueChanged.connect(lambda v: setattr(g, "group_amplitude", float(v)) or g.update())
-        form.addRow(self._wrap_label(tr("props.group_strength")), self._prep_field(ga_spin))
+        ga_sl = QSlider(Qt.Orientation.Horizontal)
+        ga_sl.setRange(0, 100)
+        ga_sl.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        ga_sl.setMinimumHeight(28 if app_settings.ui_theme() == "glass" else 22)
+        ga_sl.setValue(int(round(min(100.0, max(0.0, float(g.group_amplitude) * 10.0)))))
+        gav = QLabel(f"{float(g.group_amplitude):.1f}")
+        gav.setMinimumWidth(36)
+        gav.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        def _on_ga(x: int) -> None:
+            av = max(0, min(100, int(x))) / 10.0
+            gav.setText(f"{av:.1f}")
+            g.group_amplitude = av
+            g.update()
+
+        ga_sl.valueChanged.connect(_on_ga)
+        ga_row = QWidget()
+        ghl = QHBoxLayout(ga_row)
+        ghl.setContentsMargins(0, 0, 0, 0)
+        ghl.setSpacing(8)
+        ghl.addWidget(ga_sl, 1)
+        ghl.addWidget(gav, 0)
+        form.addRow(self._wrap_label(tr("props.group_strength")), self._prep_field(ga_row))
         group.setLayout(form)
         self.scroll_layout.addWidget(group)
 
@@ -567,13 +626,11 @@ class PropertiesPanel(QWidget):
                 except Exception:
                     pass
 
-        amp_spin = QDoubleSpinBox()
-        amp_spin.setRange(0.0, 50.0)
-        amp_spin.setSingleStep(0.5)
-        amp_spin.setDecimals(1)
-        amp_spin.setValue(min(50.0, float(elements[0].amplitude)))
-        amp_spin.valueChanged.connect(lambda v, vs=float(v): _apply_all(lambda e: setattr(e, "amplitude", min(50.0, vs))))
-        form.addRow(self._wrap_label(tr("props.amplitude")), self._prep_field(amp_spin))
+        def _amp_multi(v: int) -> None:
+            vf = float(max(0, min(50, v)))
+            _apply_all(lambda e: setattr(e, "amplitude", vf))
+
+        self._form_add_amplitude_slider(form, float(elements[0].amplitude), _amp_multi)
 
         smooth_slider = QSlider(Qt.Orientation.Horizontal)
         smooth_slider.setRange(0, 5)
@@ -719,21 +776,17 @@ class PropertiesPanel(QWidget):
         group = QGroupBox(tr("props.common"))
         form = self._form()
 
-        hint = QLabel(tr("props.common_hint"))
-        hint.setWordWrap(True)
-        hint.setStyleSheet("color: #707070; font-size: 11px;")
-        form.addRow(hint)
+        form.addRow(self._hint_one_line(tr("props.common_hint")))
 
-        amp_spin = QDoubleSpinBox()
-        amp_spin.setRange(0.0, 50.0)
-        amp_spin.setSingleStep(0.5)
-        amp_spin.setDecimals(1)
-        amp_spin.setValue(min(50.0, float(element.amplitude)))
         if float(element.amplitude) > 50.0:
             element.amplitude = 50.0
             element.update()
-        amp_spin.valueChanged.connect(lambda v: (setattr(element, "amplitude", min(50.0, float(v))), element.update()))
-        form.addRow(self._wrap_label(tr("props.amplitude")), self._prep_field(amp_spin))
+
+        def _amp_one(v: int) -> None:
+            element.amplitude = float(max(0, min(50, v)))
+            element.update()
+
+        self._form_add_amplitude_slider(form, float(element.amplitude), _amp_one)
 
         # Координаты (позиция элемента: левый верхний угол)
         x_spin = QDoubleSpinBox()
@@ -946,10 +999,7 @@ class PropertiesPanel(QWidget):
         hl.addWidget(smooth_slider, 1)
         hl.addWidget(val_lbl, 0)
         vb.addLayout(hl)
-        sh = QLabel(tr("props.smooth.hint"))
-        sh.setWordWrap(True)
-        sh.setStyleSheet("color: #707070; font-size: 10px;")
-        vb.addWidget(sh)
+        vb.addWidget(self._hint_one_line(tr("props.smooth.hint")))
         form.addRow(self._wrap_label(tr("props.smooth")), wrap)
 
     def _setup_wave_properties(
@@ -1024,23 +1074,58 @@ class PropertiesPanel(QWidget):
             bwl.setSpacing(8)
             bwl.addWidget(bar_sl, 1)
             bwl.addWidget(bar_lbl, 0)
-            form.addRow(self._wrap_label(tr("props.wave.bars")), bar_wrap)
+            bars_block = QWidget()
+            bvb = QVBoxLayout(bars_block)
+            bvb.setContentsMargins(0, 0, 0, 0)
+            bvb.setSpacing(2)
+            bvb.addWidget(bar_wrap)
+            bvb.addWidget(self._hint_one_line(tr("props.wave.bars_hint")))
+            form.addRow(self._wrap_label(tr("props.wave.bars")), self._prep_field(bars_block))
+
+            gap_sl = QSlider(Qt.Orientation.Horizontal)
+            gap_sl.setRange(0, 100)
+            gap_sl.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            gap_sl.setMinimumHeight(32 if app_settings.ui_theme() == "glass" else 26)
+            g0 = float(getattr(element, "spectrum_step_gap", 0.0))
+            gap_sl.setValue(max(0, min(100, int(round(g0 / 0.95 * 100.0)))))
+
+            def _on_gap(v: int) -> None:
+                iv = max(0, min(100, int(v)))
+                element.spectrum_step_gap = iv / 100.0 * 0.95
+                element._spectrum_hold = None
+                element.update()
+
+            gap_sl.valueChanged.connect(_on_gap)
+            gap_wrap = QWidget()
+            gpl = QHBoxLayout(gap_wrap)
+            gpl.setContentsMargins(0, 0, 0, 0)
+            gpl.setSpacing(8)
+            gpl.addWidget(gap_sl, 1)
+            gap_block = QWidget()
+            gvb = QVBoxLayout(gap_block)
+            gvb.setContentsMargins(0, 0, 0, 0)
+            gvb.setSpacing(2)
+            gvb.addWidget(gap_wrap)
+            gvb.addWidget(self._hint_one_line(tr("props.wave.gap_hint")))
+            form.addRow(self._wrap_label(tr("props.wave.gap")), self._prep_field(gap_block))
 
         dec_sl = QSlider(Qt.Orientation.Horizontal)
-        dec_sl.setRange(0, 199)
+        dec_sl.setRange(0, 2000)
         dec_sl.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         dec_sl.setMinimumHeight(32 if app_settings.ui_theme() == "glass" else 26)
 
         def _decay_ms_from_slider(v: int) -> float:
             if v <= 0:
                 return 0.0
-            return 100.0 + (float(v) - 1.0) * (2000.0 - 100.0) / 198.0
+            if v == 1:
+                return 100.0
+            return 100.0 + (float(v) - 1.0) * (2000.0 - 100.0) / (2000.0 - 1.0)
 
         def _slider_from_decay_ms(ms: float) -> int:
             if ms <= 0.0:
                 return 0
-            ms = max(100.0, min(2000.0, float(ms)))
-            return int(round((ms - 100.0) * 198.0 / (2000.0 - 100.0)) + 1)
+            m = max(100.0, min(2000.0, float(ms)))
+            return 1 + int(round((m - 100.0) * (2000.0 - 1.0) / (2000.0 - 100.0)))
 
         dec_sl.setValue(_slider_from_decay_ms(float(getattr(element, "visual_decay_ms", 0.0))))
         dec_txt = QLabel()
@@ -1067,7 +1152,13 @@ class PropertiesPanel(QWidget):
         dwl.setSpacing(8)
         dwl.addWidget(dec_sl, 1)
         dwl.addWidget(dec_txt, 0)
-        form.addRow(self._wrap_label(tr("props.wave.decay")), dec_wrap)
+        dec_block = QWidget()
+        dvb = QVBoxLayout(dec_block)
+        dvb.setContentsMargins(0, 0, 0, 0)
+        dvb.setSpacing(2)
+        dvb.addWidget(dec_wrap)
+        dvb.addWidget(self._hint_one_line(tr("props.wave.decay_hint")))
+        form.addRow(self._wrap_label(tr("props.wave.decay")), self._prep_field(dec_block))
 
         group.setLayout(form)
         self.scroll_layout.addWidget(group)
@@ -1228,6 +1319,111 @@ class PropertiesPanel(QWidget):
         
         group.setLayout(form)
         self.scroll_layout.addWidget(group)
+
+    def _setup_video_properties(self, element: VideoElement) -> None:
+        group = QGroupBox(tr("props.video"))
+        form = self._form()
+        path_edit = QLineEdit(element.video_path or "")
+        path_edit.setMinimumWidth(0)
+        path_edit.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        btn = QPushButton(tr("btn.choose_file"))
+        mw = self.window() or self
+
+        def _pick() -> None:
+            p, _ = QFileDialog.getOpenFileName(
+                qfile_dialog_parent_for_modal(mw),
+                tr("dialog.pick_video"),
+                documents_directory(),
+                tr("dialog.filter.video"),
+                "",
+                qfile_dialog_options_stable(),
+            )
+            if not p:
+                return
+            path_edit.setText(p)
+            element.video_path = p
+            try:
+                element.open_video(p, mw)
+            except Exception:
+                pass
+
+        btn.clicked.connect(_pick)
+        form.addRow(self._wrap_label(tr("props.video.file")), self._prep_field(path_edit))
+        form.addRow("", btn)
+
+        br = QDoubleSpinBox()
+        br.setRange(0.05, 4.0)
+        br.setDecimals(2)
+        br.setSingleStep(0.05)
+        br.setValue(float(getattr(element, "playback_rate_base", 1.0)))
+        br.valueChanged.connect(lambda v: setattr(element, "playback_rate_base", float(v)))
+
+        ag = QDoubleSpinBox()
+        ag.setRange(0.0, 3.0)
+        ag.setDecimals(2)
+        ag.setSingleStep(0.05)
+        ag.setValue(float(getattr(element, "playback_rate_audio_gain", 0.85)))
+        ag.valueChanged.connect(lambda v: setattr(element, "playback_rate_audio_gain", float(v)))
+
+        form.addRow(self._wrap_label(tr("props.video.rate_base")), self._prep_field(br))
+        form.addRow(self._wrap_label(tr("props.video.rate_audio")), self._prep_field(ag))
+
+        group.setLayout(form)
+        self.scroll_layout.addWidget(group)
+
+    def _setup_milkdrop_properties(self, element: MilkdropElement) -> None:
+        from elements.milkdrop_element import default_projectm_textures_dir
+
+        group = QGroupBox(tr("props.milkdrop"))
+        form = self._form()
+        pe = QLineEdit(element.preset_path or "")
+        pe.setMinimumWidth(0)
+        pe.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        mw = self.window() or self
+
+        def _pick_milk() -> None:
+            start = (element.preset_path or "").strip() or documents_directory()
+            p, _ = QFileDialog.getOpenFileName(
+                qfile_dialog_parent_for_modal(mw),
+                tr("dialog.pick_milk"),
+                start,
+                tr("dialog.filter.milk"),
+                "",
+                qfile_dialog_options_stable(),
+            )
+            if p:
+                pe.setText(p)
+                element.preset_path = p
+                element.update()
+
+        pb = QPushButton(tr("btn.choose_file"))
+        pb.clicked.connect(_pick_milk)
+        form.addRow(self._wrap_label(tr("props.milkdrop.preset")), self._prep_field(pe))
+        form.addRow("", pb)
+
+        te = QLineEdit(element.textures_dir or "")
+        te.setMinimumWidth(0)
+        te.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+        def _pick_tex() -> None:
+            d = QFileDialog.getExistingDirectory(
+                qfile_dialog_parent_for_modal(mw),
+                tr("props.milkdrop.textures"),
+                te.text() or default_projectm_textures_dir() or documents_directory(),
+                QFileDialog.Option.ShowDirsOnly,
+            )
+            if d:
+                te.setText(d)
+                element.textures_dir = d
+                element.update()
+
+        tb = QPushButton(tr("btn.browse"))
+        tb.clicked.connect(_pick_tex)
+        form.addRow(self._wrap_label(tr("props.milkdrop.textures")), self._prep_field(te))
+        form.addRow("", tb)
+
+        group.setLayout(form)
+        self.scroll_layout.addWidget(group)
     
     def _select_color(self, element):
         color = QColorDialog.getColor(element.color, self, tr("btn.choose_color"))
@@ -1248,10 +1444,7 @@ class PropertiesPanel(QWidget):
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
 
-        hint = QLabel(tr("props.freq.hint"))
-        hint.setWordWrap(True)
-        hint.setStyleSheet("color: #707070; font-size: 11px;")
-        layout.addWidget(hint)
+        layout.addWidget(self._hint_one_line(tr("props.freq.hint")))
 
         rows_wrap = QWidget()
         rows_v = QVBoxLayout(rows_wrap)

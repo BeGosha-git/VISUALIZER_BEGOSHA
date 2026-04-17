@@ -32,11 +32,11 @@ from config.app_settings import settings as app_settings
 from elements import (
     BaseVisualizationElement,
     GroupContainerElement,
-    ImageElement,
     LineElement,
     OscilloscopeElement,
     TextElement,
     TrackNameElement,
+    VideoElement,
     WaveElement,
 )
 
@@ -93,29 +93,31 @@ class PlaybackMode(QWidget):
                 new_elem = _element_from_project_item(elem_dict, root)
                 if new_elem is None:
                     continue
-                if (
-                    isinstance(new_elem, ImageElement)
-                    and self._project_root is not None
-                ):
-                    stored = str(elem_dict.get("image_path", "") or "").strip()
-                    if stored:
-                        abs_p = resolve_image_path_for_load(self._project_root, stored)
-                        if abs_p and os.path.isfile(abs_p):
-                            new_elem.load_image(abs_p)
-                            if not Path(stored).is_absolute():
-                                new_elem.image_path = stored.replace("\\", "/")
                 new_elem.setZValue(elem.zValue())
                 new_elem.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
                 new_elem.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
                 self.scene.addItem(new_elem)
                 self.playback_elements.append(new_elem)
+                try:
+                    self._open_playback_videos_recursive(new_elem, root)
+                except Exception:
+                    logger.exception("playback: open video failed for cloned tree")
                 if isinstance(new_elem, GroupContainerElement):
                     new_elem._design_pos = QPointF(float(new_elem.x()), float(new_elem.y()))
                     for ch in new_elem.members():
                         ch.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
                         ch.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
             except Exception:
+                logger.exception(
+                    "playback: clone element failed type=%s",
+                    elem_dict.get("type"),
+                )
                 continue
+
+        try:
+            self.scene.update()
+        except Exception:
+            pass
 
         self.audio_capture = AudioCapture(self)
         self.audio_capture.audio_data_ready.connect(self.on_audio_update)
@@ -149,7 +151,34 @@ class PlaybackMode(QWidget):
         self.update_timer.timeout.connect(self.update_visualization)
         self._devices_loaded = False
         self.setup_ui()
-    
+
+    def _open_playback_videos_recursive(self, node: BaseVisualizationElement, base: Path) -> None:
+        """В редакторе видео открывается по файлу; при клоне в плеер — только путь. Обходим всё дерево (в т.ч. группы)."""
+        if isinstance(node, VideoElement):
+            stored = str(getattr(node, "video_path", "") or "").strip()
+            if not stored:
+                try:
+                    node.detach_media()
+                except Exception:
+                    pass
+                node.update()
+                return
+            abs_p = resolve_image_path_for_load(base, stored)
+            if abs_p and os.path.isfile(abs_p):
+                try:
+                    node.open_video(str(abs_p), self)
+                except Exception:
+                    logger.exception("playback: open_video failed for %s", abs_p)
+            else:
+                try:
+                    node.detach_media()
+                except Exception:
+                    pass
+                node.update()
+        elif isinstance(node, GroupContainerElement):
+            for ch in node.members():
+                self._open_playback_videos_recursive(ch, base)
+
     def setup_ui(self):
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
@@ -332,7 +361,19 @@ class PlaybackMode(QWidget):
         # Останавливаем таймеры ДО stop_capture, чтобы не обновлять scene в момент остановки.
         _console_audio_debug("PlaybackMode: stop_playback()")
         self.update_timer.stop()
+
+        def _detach_videos(e: BaseVisualizationElement) -> None:
+            if isinstance(e, VideoElement):
+                try:
+                    e.detach_media()
+                except Exception:
+                    pass
+            elif isinstance(e, GroupContainerElement):
+                for c in e.members():
+                    _detach_videos(c)
+
         for e in getattr(self, "playback_elements", []) or []:
+            _detach_videos(e)
             if isinstance(e, GroupContainerElement):
                 try:
                     e.reset_playback_motion()
@@ -386,19 +427,17 @@ class PlaybackMode(QWidget):
         # Защита от редких вызовов до инициализации аудио-плейбака.
         if not hasattr(self, "audio_debug_label"):
             return
+
+        def _iter_audio_targets(items: List[BaseVisualizationElement]) -> List[BaseVisualizationElement]:
+            out: List[BaseVisualizationElement] = []
+            for e in items:
+                out.append(e)
+                if isinstance(e, GroupContainerElement):
+                    out.extend(e.members())
+            return out
+
         updated = False
         if self._has_latest_audio and self._latest_audio_data is not None:
-
-            def _iter_audio_targets(
-                items: List[BaseVisualizationElement],
-            ) -> List[BaseVisualizationElement]:
-                out: List[BaseVisualizationElement] = []
-                for e in items:
-                    out.append(e)
-                    if isinstance(e, GroupContainerElement):
-                        out.extend(e.members())
-                return out
-
             for elem in _iter_audio_targets(self.playback_elements):
                 try:
                     elem.update_audio_data(
@@ -422,6 +461,12 @@ class PlaybackMode(QWidget):
                             amps.append(0.0)
                     raw = max(amps) if amps else 0.0
                     elem.apply_playback_motion(raw * float(elem.group_amplitude))
+            for elem in _iter_audio_targets(self.playback_elements):
+                if isinstance(elem, VideoElement):
+                    try:
+                        elem.apply_playback_rate_from_audio(elem.get_amplitude_for_frequencies())
+                    except Exception:
+                        pass
             updated = True
         
         now = time.monotonic()

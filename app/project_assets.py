@@ -18,10 +18,21 @@ _IMAGE_SUFFIXES = {
     ".tiff",
 }
 
+_VIDEO_SUFFIXES = {".mp4", ".webm", ".mov", ".mkv", ".avi", ".m4v"}
+_MILK_SUFFIXES = {".milk"}
+
 
 def is_image_file(path: str | Path) -> bool:
     p = Path(path)
     return p.suffix.lower() in _IMAGE_SUFFIXES
+
+
+def is_video_file(path: str | Path) -> bool:
+    return Path(path).suffix.lower() in _VIDEO_SUFFIXES
+
+
+def is_milkdrop_file(path: str | Path) -> bool:
+    return Path(path).suffix.lower() in _MILK_SUFFIXES
 
 
 def project_dir_from_json(json_path: str | Path) -> Path:
@@ -50,6 +61,44 @@ def resolve_image_path_for_load(project_root: Path | str, stored: str) -> str:
         return str(p)
     root = Path(project_root)
     return str((root / s).resolve())
+
+
+def ensure_binary_asset_in_project(
+    project_root: Path | str,
+    src_path: str,
+    *,
+    allowed_suffixes: set[str],
+    dest_prefix: str,
+    default_ext: str,
+) -> str:
+    """Скопировать файл в assets/ с префиксом имени; вернуть относительный путь."""
+    src = Path(src_path).expanduser().resolve()
+    if not src.is_file():
+        raise FileNotFoundError(str(src))
+    root = Path(project_root).resolve()
+    ad = assets_dir(root)
+    ad.mkdir(parents=True, exist_ok=True)
+
+    try:
+        rel_try = src.relative_to(root)
+        if rel_try.parts and rel_try.parts[0] == assets_subdir():
+            return _to_posix_rel(rel_try)
+    except ValueError:
+        pass
+
+    ext = src.suffix.lower() if src.suffix else default_ext
+    if ext not in allowed_suffixes:
+        ext = default_ext
+    st = src.stat()
+    digest = hashlib.sha256(f"{src}:{st.st_mtime_ns}:{st.st_size}".encode()).hexdigest()[:12]
+    base = f"{dest_prefix}{digest}{ext}"
+    dest = ad / base
+    n = 0
+    while dest.exists():
+        n += 1
+        dest = ad / f"{dest_prefix}{digest}_{n}{ext}"
+    shutil.copy2(src, dest)
+    return _to_posix_rel(dest.relative_to(root))
 
 
 def ensure_asset_in_project(project_root: Path | str, src_path: str) -> str:
@@ -109,3 +158,54 @@ def normalize_image_elements_for_save(project_root: Path | str, elements: Iterab
                     img.load_image(resolve_image_path_for_load(root, new_rel))
             except Exception:
                 continue
+
+
+def normalize_video_milkdrop_for_save(project_root: Path | str, elements: Iterable) -> None:
+    """Перед записью JSON: видео и .milk вне проекта — копировать в assets/."""
+    from elements.group_container import GroupContainerElement
+    from elements.video_element import VideoElement
+    from elements.milkdrop_element import MilkdropElement
+
+    root = Path(project_root).resolve()
+
+    def walk(it: object) -> Iterable:
+        if isinstance(it, (VideoElement, MilkdropElement)):
+            yield it
+        elif isinstance(it, GroupContainerElement):
+            for ch in it.members():
+                yield from walk(ch)
+
+    for elem in elements:
+        for node in walk(elem):
+            if isinstance(node, VideoElement):
+                raw = (node.video_path or "").strip()
+                if not raw:
+                    continue
+                try:
+                    new_rel = ensure_binary_asset_in_project(
+                        root,
+                        raw,
+                        allowed_suffixes=_VIDEO_SUFFIXES,
+                        dest_prefix="vid_",
+                        default_ext=".mp4",
+                    )
+                    if new_rel != raw.replace("\\", "/"):
+                        node.video_path = new_rel
+                except Exception:
+                    continue
+            elif isinstance(node, MilkdropElement):
+                raw = (node.preset_path or "").strip()
+                if not raw:
+                    continue
+                try:
+                    new_rel = ensure_binary_asset_in_project(
+                        root,
+                        raw,
+                        allowed_suffixes=_MILK_SUFFIXES,
+                        dest_prefix="milk_",
+                        default_ext=".milk",
+                    )
+                    if new_rel != raw.replace("\\", "/"):
+                        node.preset_path = new_rel
+                except Exception:
+                    continue

@@ -9,6 +9,8 @@ from .text_element import TextElement
 from .track_name_element import TrackNameElement
 from .line_element import LineElement
 from .group_container import GroupContainerElement
+from .video_element import VideoElement
+from .milkdrop_element import MilkdropElement
 
 __all__ = [
     'BaseVisualizationElement',
@@ -19,4 +21,6 @@ __all__ = [
     'TrackNameElement',
     'LineElement',
     'GroupContainerElement',
+    'VideoElement',
+    'MilkdropElement',
 ]

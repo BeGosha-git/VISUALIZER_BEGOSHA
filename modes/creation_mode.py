@@ -54,7 +54,10 @@ from app.paths import (
 from ui.toast import show_toast
 from app.project_assets import (
     is_image_file,
+    is_milkdrop_file,
+    is_video_file,
     normalize_image_elements_for_save,
+    normalize_video_milkdrop_for_save,
     resolve_image_path_for_load,
 )
 from config.app_settings import settings
@@ -63,9 +66,11 @@ from elements import (
     GroupContainerElement,
     ImageElement,
     LineElement,
+    MilkdropElement,
     OscilloscopeElement,
     TextElement,
     TrackNameElement,
+    VideoElement,
     WaveElement,
 )
 from ui.canvas_view import InteractiveCanvasView
@@ -82,6 +87,8 @@ _ELEMENT_CLASS_MAP = {
     "TextElement": TextElement,
     "TrackNameElement": TrackNameElement,
     "LineElement": LineElement,
+    "VideoElement": VideoElement,
+    "MilkdropElement": MilkdropElement,
 }
 
 
@@ -116,6 +123,17 @@ def _element_from_project_item(elem_data: Dict[str, Any], pp: Path) -> Optional[
                 element.load_image(abs_p)
                 if not Path(stored).is_absolute():
                     element.image_path = stored.replace("\\", "/")
+    elif elem_type == "VideoElement":
+        stored = str(elem_data.get("video_path", "") or "").strip()
+        if stored and isinstance(element, VideoElement):
+            abs_p = resolve_image_path_for_load(pp, stored)
+            if abs_p and os.path.isfile(abs_p):
+                element.video_path = stored.replace("\\", "/") if not Path(stored).is_absolute() else stored
+    elif elem_type == "MilkdropElement" and isinstance(element, MilkdropElement):
+        for key in ("preset_path", "textures_dir"):
+            val = str(elem_data.get(key, "") or "").strip()
+            if val and not Path(val).is_absolute():
+                setattr(element, key, val.replace("\\", "/"))
     return element
 
 
@@ -331,6 +349,7 @@ class CreationMode(QWidget):
             pp = project_parent if project_parent is not None else self._project_parent_for_paths()
 
             for elem in self.elements:
+                self._detach_videos_in_tree(elem)
                 self.scene.removeItem(elem)
             self.elements.clear()
 
@@ -351,6 +370,8 @@ class CreationMode(QWidget):
                 except Exception as e:
                     logger.warning("Ошибка загрузки элемента %s: %s", elem_data.get("type"), e)
                     continue
+
+            QTimer.singleShot(0, self._reattach_all_project_videos)
 
             self.scene.clearSelection()
             self.properties_panel.clear_properties()
@@ -393,6 +414,47 @@ class CreationMode(QWidget):
             self.properties_panel.show_properties_multi(sel)
         else:
             self.properties_panel.clear_properties()
+
+    def _reattach_video_in_tree(self, root: BaseVisualizationElement) -> None:
+        if isinstance(root, VideoElement):
+            self._start_video_from_saved_path(root)
+        elif isinstance(root, GroupContainerElement):
+            for ch in root.members():
+                self._reattach_video_in_tree(ch)
+
+    def _start_video_from_saved_path(self, v: VideoElement) -> None:
+        raw = (getattr(v, "video_path", "") or "").strip()
+        if not raw:
+            try:
+                v.detach_media()
+            except Exception:
+                pass
+            v.update()
+            return
+        pp = self._project_parent_for_paths()
+        abs_p = resolve_image_path_for_load(pp, raw)
+        if abs_p and os.path.isfile(abs_p):
+            v.open_video(abs_p, self)
+        else:
+            try:
+                v.detach_media()
+            except Exception:
+                pass
+            v.update()
+
+    def _detach_videos_in_tree(self, root: BaseVisualizationElement) -> None:
+        if isinstance(root, VideoElement):
+            try:
+                root.detach_media()
+            except Exception:
+                pass
+        elif isinstance(root, GroupContainerElement):
+            for ch in root.members():
+                self._detach_videos_in_tree(ch)
+
+    def _reattach_all_project_videos(self) -> None:
+        for e in list(self.elements):
+            self._reattach_video_in_tree(e)
 
     def editor_group_selected(self) -> None:
         sel = self._selected_base_elements()
@@ -494,6 +556,8 @@ class CreationMode(QWidget):
         self.scene.clearSelection()
         for ne in new_items:
             ne.setSelected(True)
+        for ne in new_items:
+            QTimer.singleShot(0, lambda el=ne: self._reattach_video_in_tree(el))
         self.scene.update()
         self._refresh_properties_for_selection()
         self._history_commit_if_changed()
@@ -600,6 +664,8 @@ class CreationMode(QWidget):
         self.scene.clearSelection()
         for el in new_items:
             el.setSelected(True)
+        for el in new_items:
+            QTimer.singleShot(0, lambda e=el: self._reattach_video_in_tree(e))
         self.scene.update()
         self._refresh_properties_for_selection()
         self._history_commit_if_changed()
@@ -751,12 +817,20 @@ class CreationMode(QWidget):
             self.editor_reset_canvas_zoom()
             event.accept()
             return
+        if k == Qt.Key.Key_G and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                self.editor_ungroup_selected()
+            else:
+                self.editor_group_selected()
+            event.accept()
+            return
         QGraphicsView.keyPressEvent(self.view, event)
 
     def _write_project_json(self, path: str, *, show_success_dialog: bool) -> None:
         project_root = Path(path).resolve().parent
         elements_to_save = [elem for elem in self.elements if isinstance(elem, BaseVisualizationElement)]
         normalize_image_elements_for_save(project_root, elements_to_save)
+        normalize_video_milkdrop_for_save(project_root, elements_to_save)
         data = self._collect_project_data()
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -852,26 +926,19 @@ class CreationMode(QWidget):
             ("T", tr("el.text"), "text"),
             ("♪", tr("el.track"), "track"),
             ("/", tr("el.line"), "line"),
+            ("m", tr("el.milkdrop"), "milkdrop"),
+            ("▶", tr("el.video"), "video"),
         ]
-        
-        # Создаём сетку 2x3
-        row1 = QHBoxLayout()
-        row1.setSpacing(5)
-        row1.setContentsMargins(0, 0, 0, 0)
-        row2 = QHBoxLayout()
-        row2.setSpacing(5)
-        row2.setContentsMargins(0, 0, 0, 0)
-        
-        for i, (icon, name, elem_type) in enumerate(elements_data):
-            btn = ElementButton(name, icon, elem_type, self, cell_side=element_cell)
-            btn.clicked.connect(lambda checked, t=elem_type: self.add_element_by_type(t))
-            if i < 3:
-                row1.addWidget(btn)
-            else:
-                row2.addWidget(btn)
-        
-        elements_grid_layout.addLayout(row1)
-        elements_grid_layout.addLayout(row2)
+
+        for row_i in range(0, len(elements_data), 3):
+            row = QHBoxLayout()
+            row.setSpacing(5)
+            row.setContentsMargins(0, 0, 0, 0)
+            for icon, name, elem_type in elements_data[row_i : row_i + 3]:
+                btn = ElementButton(name, icon, elem_type, self, cell_side=element_cell)
+                btn.clicked.connect(lambda checked, t=elem_type: self.add_element_by_type(t))
+                row.addWidget(btn)
+            elements_grid_layout.addLayout(row)
         elements_grid.setLayout(elements_grid_layout)
         left_layout.addWidget(elements_grid)
         
@@ -909,6 +976,10 @@ class CreationMode(QWidget):
         ugrp_btn = QPushButton(tr("editor.ungroup"))
         ugrp_btn.clicked.connect(self.editor_ungroup_selected)
         project_l.addWidget(ugrp_btn)
+        gh = QLabel(tr("editor.group_select_hint"))
+        gh.setWordWrap(True)
+        gh.setStyleSheet("color: #808080; font-size: 10px;")
+        project_l.addWidget(gh)
 
         play_btn = QPushButton(tr("editor.play"))
         play_btn.clicked.connect(self.start_playback)
@@ -943,7 +1014,9 @@ class CreationMode(QWidget):
         self.view.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.view.setStyleSheet("border: none;")
         self.view.setFrameShape(QFrame.Shape.NoFrame)
-        self.view.setDragMode(QGraphicsView.DragMode.NoDrag)  # Отключаем RubberBandDrag чтобы не было следов
+        self.view.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
+        self.view.setRubberBandSelectionMode(Qt.ItemSelectionMode.IntersectsItemBoundingRect)
+        self.view.setViewportUpdateMode(QGraphicsView.ViewportUpdateMode.SmartViewportUpdate)
         # Включаем масштабирование колесом мыши
         self.view.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.view.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
@@ -1132,7 +1205,11 @@ class CreationMode(QWidget):
             self.add_track_name()
         elif element_type == "line":
             self.add_line()
-    
+        elif element_type == "milkdrop":
+            self.add_milkdrop()
+        elif element_type == "video":
+            self.add_video()
+
     def _on_aspect_changed(self, _index: int = 0) -> None:
         """Обработка изменения пропорций (данные в элементе списка)."""
         data = self.aspect_combo.currentData()
@@ -1250,6 +1327,7 @@ class CreationMode(QWidget):
         self.elements.append(new_el)
         self.scene.clearSelection()
         new_el.setSelected(True)
+        QTimer.singleShot(0, lambda: self._reattach_video_in_tree(new_el))
         self.scene.update()
         self._refresh_properties_for_selection()
         self._history_commit_if_changed()
@@ -1293,8 +1371,14 @@ class CreationMode(QWidget):
         self._history_commit_if_changed()
 
     def _element_delete(self, element: BaseVisualizationElement, *, commit_history: bool = True) -> None:
+        if isinstance(element, VideoElement):
+            try:
+                element.detach_media()
+            except Exception:
+                pass
         if isinstance(element, GroupContainerElement):
             for ch in list(element.members()):
+                self._detach_videos_in_tree(ch)
                 ch.setParentItem(None)
                 try:
                     self.scene.removeItem(ch)
@@ -1353,27 +1437,29 @@ class CreationMode(QWidget):
             event.accept()
             return
 
-        # Проверка на resize handle (координаты сцены — см. BaseVisualizationElement.get_resize_handle_at)
+        # Маркеры / множественное выделение (Shift — добавить, Ctrl — переключить) + рамка на пустом месте.
         if not self.is_drawing_line and event.button() == Qt.MouseButton.LeftButton:
             scene_pos = self.view.mapToScene(view_pt)
             item = _top_base_element_at_view(self.view, view_pt)
             if item and isinstance(item, BaseVisualizationElement):
-                # Сначала — крутилка поворота (она должна иметь приоритет над resize).
-                try:
-                    # Сразу выделяем, чтобы handle был виден и логика была стабильной.
-                    if not item.isSelected():
-                        self.scene.clearSelection()
-                        item.setSelected(True)
+                from PyQt6.QtGui import QGuiApplication
 
+                mods = QGuiApplication.keyboardModifiers()
+                shift = bool(mods & Qt.KeyboardModifier.ShiftModifier)
+                ctrl = bool(mods & Qt.KeyboardModifier.ControlModifier)
+                additive = shift or ctrl
+
+                try:
                     if item.get_rotate_handle_at(scene_pos):
+                        if not item.isSelected():
+                            if not additive:
+                                self.scene.clearSelection()
+                            item.setSelected(True)
                         self.rotating_element = item
-                        # Центр вращения строго по width/height (boundingRect меняется из-за handles).
                         center = item.mapToScene(QPointF(item.width / 2, item.height / 2))
                         v = scene_pos - center
                         import math
 
-                        # Поворот считаем от движения мыши (дельтами), а не от “иконки”.
-                        # Так нет скачков на -180/180 и меньше “самоподкручивания”.
                         ang = math.degrees(math.atan2(v.y(), v.x()))
                         self.rotate_start_angle = ang
                         self.rotate_last_angle = ang
@@ -1383,16 +1469,38 @@ class CreationMode(QWidget):
                         return
                 except Exception:
                     pass
-                handle = item.get_resize_handle_at(scene_pos)
-                if handle:
-                    item.setSelected(True)
-                    self.resizing_element = item
-                    self.resize_handle = handle
-                    self.resize_start_pos = scene_pos
-                    self.resize_start_size = (item.width, item.height)
-                    self.resize_start_pos_item = (item.x(), item.y())
-                    event.accept()
+
+                try:
+                    handle = item.get_resize_handle_at(scene_pos)
+                    if handle:
+                        if not item.isSelected():
+                            if not additive:
+                                self.scene.clearSelection()
+                            item.setSelected(True)
+                        self.resizing_element = item
+                        self.resize_handle = handle
+                        self.resize_start_pos = scene_pos
+                        self.resize_start_size = (item.width, item.height)
+                        self.resize_start_pos_item = (item.x(), item.y())
+                        event.accept()
+                        return
+                except Exception:
+                    pass
+
+                if ctrl:
+                    item.setSelected(not item.isSelected())
+                    if not item.isSelected():
+                        event.accept()
+                        return
+                    super(type(self.view), self.view).mousePressEvent(event)
                     return
+                if shift:
+                    item.setSelected(True)
+                    super(type(self.view), self.view).mousePressEvent(event)
+                    return
+                if not item.isSelected():
+                    self.scene.clearSelection()
+                    item.setSelected(True)
 
         # Явный super: unbound QGraphicsView.mousePressEvent(self.view, …) даёт сбои/рекурсию в части сборок PyQt6.
         super(type(self.view), self.view).mousePressEvent(event)
@@ -1629,7 +1737,19 @@ class CreationMode(QWidget):
             self.view.graphics_view_mouse_release(event)
     
     def on_selection_changed(self):
-        self._refresh_properties_for_selection()
+        # Не пересобирать панель свойств синхронно из цепочки mousePress сцены —
+        # иначе возможен краш (удаление виджетов во время обработки события вида).
+        app = QApplication.instance()
+        if app is None:
+            self._deferred_refresh_properties_after_selection()
+            return
+        QTimer.singleShot(0, self._deferred_refresh_properties_after_selection)
+
+    def _deferred_refresh_properties_after_selection(self) -> None:
+        try:
+            self._refresh_properties_for_selection()
+        except Exception:
+            logger.exception("properties refresh after selection failed")
     
     def _prepare_import_image_path(self, path: str) -> Optional[str]:
         """Диалог удаления фона; None — отмена или ошибка чтения файла."""
@@ -1862,7 +1982,11 @@ class CreationMode(QWidget):
             for u in mime.urls():
                 if u.isLocalFile():
                     lf = u.toLocalFile()
-                    if lf and is_image_file(Path(lf)):
+                    if lf and (
+                        is_image_file(Path(lf))
+                        or is_video_file(Path(lf))
+                        or is_milkdrop_file(Path(lf))
+                    ):
                         return True
         return False
 
@@ -1970,6 +2094,63 @@ class CreationMode(QWidget):
             self.line_hint_label.setVisible(True)
         # Линия будет создана при первом клике
 
+    def add_milkdrop(self) -> None:
+        if not self.resolution_background:
+            show_toast(self, tr("err.resolution_init"), "warn", 4000)
+            return
+        from elements.milkdrop_element import default_projectm_preset_dir
+
+        start = default_projectm_preset_dir() or documents_directory()
+        path, _ = QFileDialog.getOpenFileName(
+            qfile_dialog_parent_for_modal(self.window() or self),
+            tr("dialog.pick_milk"),
+            start,
+            tr("dialog.filter.milk"),
+            "",
+            qfile_dialog_options_stable(),
+        )
+        if not path:
+            return
+        bg = self.resolution_background
+        w, h = float(bg.width) * 0.85, float(bg.height) * 0.85
+        x = float(bg.x()) + (float(bg.width) - w) / 2.0
+        y = float(bg.y()) + (float(bg.height) - h) / 2.0
+        el = MilkdropElement(x, y, w, h)
+        el.preset_path = path
+        el.setZValue(5)
+        self.scene.addItem(el)
+        self.elements.append(el)
+        el.setSelected(True)
+        self._refresh_properties_for_selection()
+        self._history_commit_if_changed()
+
+    def add_video(self) -> None:
+        if not self.resolution_background:
+            show_toast(self, tr("err.resolution_init"), "warn", 4000)
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            qfile_dialog_parent_for_modal(self.window() or self),
+            tr("dialog.pick_video"),
+            documents_directory(),
+            tr("dialog.filter.video"),
+            "",
+            qfile_dialog_options_stable(),
+        )
+        if not path:
+            return
+        bg = self.resolution_background
+        w, h = float(bg.width) * 0.55, float(bg.height) * 0.55
+        x = float(bg.x()) + (float(bg.width) - w) / 2.0
+        y = float(bg.y()) + (float(bg.height) - h) / 2.0
+        el = VideoElement(x, y, w, h, path)
+        el.setZValue(80)
+        self.scene.addItem(el)
+        self.elements.append(el)
+        el.setSelected(True)
+        QTimer.singleShot(0, lambda: self._reattach_video_in_tree(el))
+        self._refresh_properties_for_selection()
+        self._history_commit_if_changed()
+
     def cancel_line_drawing(self):
         """Отменить незавершённое рисование линии."""
         if self.current_line_element:
@@ -2047,6 +2228,45 @@ class CreationMode(QWidget):
                     self._create_image_element_at_scene(scene_pos, lf, skip_import_dialog=True)
                     event.acceptProposedAction()
                     self.view.setStyleSheet("border: none;")
+                    return
+                if lf and is_video_file(Path(lf)) and os.path.isfile(lf) and self.resolution_background:
+                    w, h = 320.0, 180.0
+                    el = VideoElement(
+                        float(scene_pos.x()) - w / 2,
+                        float(scene_pos.y()) - h / 2,
+                        w,
+                        h,
+                        lf,
+                    )
+                    el.setZValue(80)
+                    self.scene.addItem(el)
+                    self.elements.append(el)
+                    QTimer.singleShot(0, lambda e=el: self._reattach_video_in_tree(e))
+                    event.acceptProposedAction()
+                    self.view.setStyleSheet("border: none;")
+                    self._history_commit_if_changed()
+                    return
+                if lf and is_milkdrop_file(Path(lf)) and os.path.isfile(lf) and self.resolution_background:
+                    from elements.milkdrop_element import default_projectm_textures_dir
+
+                    bg = self.resolution_background
+                    w, h = float(bg.width) * 0.85, float(bg.height) * 0.85
+                    el = MilkdropElement(
+                        float(scene_pos.x()) - w / 2,
+                        float(scene_pos.y()) - h / 2,
+                        w,
+                        h,
+                    )
+                    el.preset_path = lf
+                    td = default_projectm_textures_dir()
+                    if td:
+                        el.textures_dir = td
+                    el.setZValue(5)
+                    self.scene.addItem(el)
+                    self.elements.append(el)
+                    event.acceptProposedAction()
+                    self.view.setStyleSheet("border: none;")
+                    self._history_commit_if_changed()
                     return
 
         if mime.hasImage():
@@ -2129,6 +2349,58 @@ class CreationMode(QWidget):
                 element.setZValue(100)
                 self.scene.addItem(element)
                 self.elements.append(element)
+            elif element_type == "video":
+                dlg_parent = self.parent_window if getattr(self, "parent_window", None) else self.window() or self
+                path, _ = QFileDialog.getOpenFileName(
+                    qfile_dialog_parent_for_modal(dlg_parent),
+                    tr("dialog.pick_video"),
+                    documents_directory(),
+                    tr("dialog.filter.video"),
+                    "",
+                    qfile_dialog_options_stable(),
+                )
+                if path and self.resolution_background:
+                    w, h = 320.0, 180.0
+                    el = VideoElement(
+                        float(scene_pos.x()) - w / 2,
+                        float(scene_pos.y()) - h / 2,
+                        w,
+                        h,
+                        path,
+                    )
+                    el.setZValue(80)
+                    self.scene.addItem(el)
+                    self.elements.append(el)
+                    QTimer.singleShot(0, lambda e=el: self._reattach_video_in_tree(e))
+            elif element_type == "milkdrop":
+                dlg_parent = self.parent_window if getattr(self, "parent_window", None) else self.window() or self
+                from elements.milkdrop_element import default_projectm_preset_dir, default_projectm_textures_dir
+
+                start = default_projectm_preset_dir() or documents_directory()
+                path, _ = QFileDialog.getOpenFileName(
+                    qfile_dialog_parent_for_modal(dlg_parent),
+                    tr("dialog.pick_milk"),
+                    start,
+                    tr("dialog.filter.milk"),
+                    "",
+                    qfile_dialog_options_stable(),
+                )
+                if path and self.resolution_background:
+                    bg = self.resolution_background
+                    w, h = float(bg.width) * 0.85, float(bg.height) * 0.85
+                    el = MilkdropElement(
+                        float(scene_pos.x()) - w / 2,
+                        float(scene_pos.y()) - h / 2,
+                        w,
+                        h,
+                    )
+                    el.preset_path = path
+                    td = default_projectm_textures_dir()
+                    if td:
+                        el.textures_dir = td
+                    el.setZValue(5)
+                    self.scene.addItem(el)
+                    self.elements.append(el)
             elif element_type == "line":
                 self.add_line()
                 self.current_line_element = LineElement(scene_pos.x(), scene_pos.y())

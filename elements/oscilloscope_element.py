@@ -174,4 +174,8 @@ class OscilloscopeElement(WaveElement):
             element.visual_decay_ms = max(0.0, min(5000.0, float(data.get("visual_decay_ms", 0.0))))
         except (TypeError, ValueError):
             element.visual_decay_ms = 0.0
+        try:
+            element.spectrum_step_gap = max(0.0, min(0.95, float(data.get("spectrum_step_gap", 0.0))))
+        except (TypeError, ValueError):
+            element.spectrum_step_gap = 0.0
         return element

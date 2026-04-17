@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 
 def _catmull_path(points: List[QPointF]) -> QPainterPath:
-    """Открытая кривая через точки (Catmull-Rom → кубические Безье)."""
+    """Открытая кривая через точки (Catmull-Rom → кубические Безье). Для осциллографа."""
     path = QPainterPath()
     n = len(points)
     if n == 0:
@@ -41,6 +41,40 @@ def _catmull_path(points: List[QPointF]) -> QPainterPath:
     return path
 
 
+def _fill_bar_figure(
+    painter: QPainter,
+    x0: float,
+    x1: float,
+    y_top: float,
+    y_base: float,
+    form: int,
+) -> None:
+    """Заливка одного столбца спектра: 1 — треугольник, 2 — четырёхугольник, 3+ — скругление / «круг»."""
+    if x1 <= x0 + 0.25:
+        return
+    yt = min(y_top, y_base)
+    yb = max(y_top, y_base)
+    path = QPainterPath()
+    if form <= 1:
+        # Треугольник: низ — основание, вершина — по центру сверху
+        cx = (x0 + x1) * 0.5
+        path.moveTo(QPointF(x0, yb))
+        path.lineTo(QPointF(cx, yt))
+        path.lineTo(QPointF(x1, yb))
+        path.closeSubpath()
+    elif form == 2:
+        path.addRect(QRectF(x0, yt, x1 - x0, yb - yt))
+    else:
+        bw = x1 - x0
+        h = yb - yt
+        r = min(bw * 0.48, h * 0.95)
+        if form >= 8:
+            r = min(bw * 0.5, h * 0.5)
+        r = max(0.0, min(r, bw * 0.5, h))
+        path.addRoundedRect(QRectF(x0, yt, bw, h), r, r)
+    painter.drawPath(path)
+
+
 class WaveElement(BaseVisualizationElement):
     """Элемент красивой волны"""
 
@@ -48,14 +82,14 @@ class WaveElement(BaseVisualizationElement):
         super().__init__(x, y, width, height)
         self.color = QColor(100, 150, 255)
         self.line_width = 3.0
-        # smoothing_passes — в базовом классе: временная амплитуда + проходы Чайкина (см. paint).
         self.wave_points: List[QPointF] = []
-        # 0 — острая ломаная … 8 — плавная «окружность» (кривая Безье).
+        # 0 — линия по точкам; 1 — треугольник; 2 — прямоугольник; 3…7 — скругление; 8 — «круглая» шапка.
         self.display_form: int = 0
-        # Сколько столбцов/точек по ширине (объединение соседних частотных бинов): 1…256.
         self.spectrum_bar_count: int = 128
-        # 0 — без следа; иначе время затухания «фосфора» в мс (100…2000).
+        # 0 — без следа; иначе мс затухания (100…2000), задаётся слайдером.
         self.visual_decay_ms: float = 0.0
+        # 0…95 — доля зазора между столбцами (от ширины бина).
+        self.spectrum_step_gap: float = 0.0
         self._spectrum_hold: np.ndarray | None = None
         self._last_audio_mono: float = 0.0
         self._form_dt: float = 0.02
@@ -71,20 +105,16 @@ class WaveElement(BaseVisualizationElement):
         try:
             painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-            # Placeholder если нет данных
             if len(self.fft_data) == 0:
-                # Убеждаемся что размеры больше 0
                 w = max(100.0, self.width)
                 h = max(50.0, self.height)
                 rect = QRectF(0, 0, w, h)
 
-                # Рамка
                 painter.setPen(QPen(QColor(200, 200, 200), 3, Qt.PenStyle.DashLine))
-                painter.setBrush(QBrush(QColor(40, 40, 40, 200)))  # Более непрозрачный для видимости
+                painter.setBrush(QBrush(QColor(40, 40, 40, 200)))
                 painter.drawRect(rect)
 
-                # Текст
-                painter.setPen(QPen(QColor(255, 255, 255)))  # Белый текст для лучшей видимости
+                painter.setPen(QPen(QColor(255, 255, 255)))
                 font = painter.font()
                 font.setPointSize(16)
                 font.setBold(True)
@@ -93,15 +123,13 @@ class WaveElement(BaseVisualizationElement):
 
                 painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, tr("canvas.wave"))
 
-                # Handles
                 if self.isSelected():
                     self.paint_selection_handles(painter)
                 return
 
-            painter.setPen(QPen(self.color, self.line_width))
+            painter.setPen(QPen(self.color, max(0.5, self.line_width * 0.35)))
+            painter.setBrush(QBrush(self.color))
 
-            # Без выбранных диапазонов частот не «оживляем» волну от общего FFT —
-            # иначе демо/фоновый сигнал даёт ложное движение при настройке.
             amplitude_factor = self.get_amplitude_for_frequencies()
 
             fd = np.asarray(self.fft_data, dtype=float).reshape(-1)
@@ -131,38 +159,48 @@ class WaveElement(BaseVisualizationElement):
                 plot_vals = vals
 
             form = max(0, min(8, int(getattr(self, "display_form", 0))))
-            if form > 0:
-                k = 1 + 2 * min(8, form)
-                wv = np.hanning(k)
-                wv = wv / float(np.sum(wv))
-                plot_vals = np.convolve(plot_vals, wv, mode="same")
+            gap = max(0.0, min(0.95, float(getattr(self, "spectrum_step_gap", 0.0) or 0.0)))
 
-            num_points = int(plot_vals.size)
-            points: List[QPointF] = []
-            for i in range(num_points):
-                if num_points > 1:
-                    x = (i / (num_points - 1)) * self.width
-                else:
-                    x = self.width * 0.5
-                v = float(plot_vals[i])
-                y = self.height / 2 - (v * self.height / 2 * amplitude_factor)
-                y = max(1.0, min(float(self.height) - 1.0, y))
-                points.append(QPointF(x, y))
+            w = float(self.width)
+            h = float(self.height)
+            y_base = h * 0.5
+            bw = w / float(max(1, n_bars))
+            inner = bw * (1.0 - gap)
+            margin = bw * gap * 0.5
 
-            if len(points) > 1:
-                passes = max(0, min(5, int(getattr(self, "smoothing_passes", 0))))
-                if passes > 0 and len(points) > 3:
-                    for _ in range(passes):
-                        if len(points) < 3:
-                            break
-                        points = self._smooth_points(points)
-
-                if form <= 4:
+            if form == 0:
+                num_points = int(plot_vals.size)
+                points: List[QPointF] = []
+                for i in range(num_points):
+                    if num_points > 1:
+                        cx = (i + 0.5) / float(num_points) * w
+                    else:
+                        cx = w * 0.5
+                    v = float(plot_vals[i])
+                    y = y_base - (v * h * 0.5 * amplitude_factor)
+                    y = max(1.0, min(h - 1.0, y))
+                    points.append(QPointF(cx, y))
+                if len(points) > 1:
+                    passes = max(0, min(5, int(getattr(self, "smoothing_passes", 0))))
+                    if passes > 0 and len(points) > 3:
+                        for _ in range(passes):
+                            if len(points) < 3:
+                                break
+                            points = self._smooth_points(points)
+                    painter.setBrush(Qt.BrushStyle.NoBrush)
+                    painter.setPen(QPen(self.color, self.line_width))
                     painter.drawPolyline(QPolygonF(points))
-                else:
-                    painter.drawPath(_catmull_path(points))
+            else:
+                painter.setPen(QPen(self.color, max(0.5, self.line_width * 0.2)))
+                painter.setBrush(QBrush(self.color))
+                for i in range(n_bars):
+                    v = float(plot_vals[i])
+                    y_top = y_base - (v * h * 0.5 * amplitude_factor)
+                    y_top = max(1.0, min(h - 1.0, y_top))
+                    x0 = float(i) * bw + margin
+                    x1 = x0 + inner
+                    _fill_bar_figure(painter, x0, x1, y_top, y_base, form)
 
-            # Отрисовка handles при выделении
             if self.isSelected():
                 self.paint_selection_handles(painter)
         except Exception as e:
@@ -170,7 +208,6 @@ class WaveElement(BaseVisualizationElement):
             return
 
     def _smooth_points(self, points: List[QPointF]) -> List[QPointF]:
-        """Сглаживание алгоритмом Чайкина — без scipy, быстро и стабильно."""
         if len(points) < 3:
             return points
         new_pts: List[QPointF] = [points[0]]
@@ -189,6 +226,7 @@ class WaveElement(BaseVisualizationElement):
         data["display_form"] = int(getattr(self, "display_form", 0))
         data["spectrum_bar_count"] = int(getattr(self, "spectrum_bar_count", 128))
         data["visual_decay_ms"] = float(getattr(self, "visual_decay_ms", 0.0))
+        data["spectrum_step_gap"] = float(getattr(self, "spectrum_step_gap", 0.0))
         return data
 
     @classmethod
@@ -214,4 +252,8 @@ class WaveElement(BaseVisualizationElement):
             element.visual_decay_ms = max(0.0, min(5000.0, float(data.get("visual_decay_ms", 0.0))))
         except (TypeError, ValueError):
             element.visual_decay_ms = 0.0
+        try:
+            element.spectrum_step_gap = max(0.0, min(0.95, float(data.get("spectrum_step_gap", 0.0))))
+        except (TypeError, ValueError):
+            element.spectrum_step_gap = 0.0
         return element
